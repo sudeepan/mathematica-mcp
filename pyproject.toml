@@ -25,7 +25,10 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=1.0.0",
+    # <2 is required, not cautionary: mcp 2.x renamed FastMCP to MCPServer and
+    # moved the module, so `from mcp.server.fastmcp import FastMCP` in server.py
+    # raises ModuleNotFoundError on import and the server cannot start at all.
+    "mcp>=1.0.0,<2",
     "wolframclient>=1.4.0",
 ]
 
