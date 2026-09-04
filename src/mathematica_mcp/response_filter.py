@@ -70,6 +70,9 @@ _COMPACT_KEEP = frozenset(
         "rendered_image",
         "is_graphics",
         "output_inputform",  # kept temporarily for graphics swap, may be stripped after
+        "headless",  # which notebook backend answered — changes what follow-ups are possible
+        "cell_index",  # headless cells are addressed by index, so this IS the handle
+        "notebook_written",
     }
 )
 

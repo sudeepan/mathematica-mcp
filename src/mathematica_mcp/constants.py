@@ -16,6 +16,7 @@ class ExecutionPath:
     ADDON_CLI = "addon_cli"
     KERNEL_FALLBACK = "kernel_fallback"
     KERNEL_DIRECT_ROUTING_SKIP = "kernel_direct_routing_skip"
+    KERNEL_DIRECT_HEADLESS = "kernel_direct_headless"
 
 
 class AttemptOutcome(enum.Enum):

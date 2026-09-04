@@ -240,6 +240,41 @@ def check_wolframscript() -> tuple[bool, str]:
     return False, "wolframscript not found in PATH"
 
 
+def check_kernel_discovery() -> tuple[bool, str]:
+    """Whether a Wolfram kernel can be located.
+
+    The most consequential check on this list: without a kernel path the server
+    never builds its persistent session and every call degrades to a cold
+    subprocess — or fails outright when wolframscript cannot find a kernel
+    either, which is what happens when the MCP client passes a minimal PATH.
+    """
+    from .kernel_discovery import find_wolfram_kernel
+
+    kernel = find_wolfram_kernel()
+    if kernel:
+        return True, f"Wolfram kernel at {kernel}"
+    return False, (
+        "No Wolfram kernel found. Set MATHEMATICA_KERNEL_PATH to the WolframKernel "
+        "executable, or put the installation's Executables directory on PATH."
+    )
+
+
+def check_headless_mode() -> tuple[bool, str]:
+    """Report which notebook backend this host will use.
+
+    Always 'ok': headless is a supported configuration, not a fault. It is
+    reported because the difference decides which tools can work at all.
+    """
+    from .kernel_discovery import is_headless
+
+    if is_headless():
+        return True, (
+            "No display detected - notebook tools will use the headless backend "
+            "(.nb files on disk via the kernel). Screenshots and live windows are unavailable."
+        )
+    return True, "Display detected - live notebook windows available"
+
+
 def check_mathematica_addon() -> tuple[bool, str]:
     """Check if Mathematica addon is installed."""
     system = get_system()
@@ -742,6 +777,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         error(msg)
         all_ok = False
 
+    # Wolfram kernel — the check the persistent session depends on
+    ok, msg = check_kernel_discovery()
+    if ok:
+        success(msg)
+    else:
+        error(msg)
+        all_ok = False
+
+    # Headless or windowed
+    _, msg = check_headless_mode()
+    info(msg)
+
     # Mathematica addon
     ok, msg = check_mathematica_addon()
     if ok:
@@ -755,8 +802,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if ok:
         success(msg)
     else:
-        warn(msg)
-        print("    Start Mathematica to launch the MCP server")
+        from .kernel_discovery import is_headless
+
+        if is_headless():
+            info(f"{msg} - not needed on this host; notebook work uses the headless backend")
+        else:
+            warn(msg)
+            print("    Start Mathematica to launch the MCP server")
 
     # Client configs
     print(f"\n{color('Client configurations:', BOLD)}")

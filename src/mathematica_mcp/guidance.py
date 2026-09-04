@@ -97,14 +97,29 @@ def _style_keyword_bullets(features: FeatureFlags) -> list[str]:
     return bullets
 
 
+def _notebook_meaning() -> str:
+    """What "notebook" means here — which depends on whether a front end exists.
+
+    Telling a headless caller that a notebook is a live window sends it to
+    notebooks(action="create") and screenshot(), neither of which can work, and
+    away from the .nb file it was actually asked about.
+    """
+    from .kernel_discovery import is_headless
+
+    if is_headless():
+        return (
+            'A "notebook" here means a `.nb` FILE ON DISK: this host has no frontend, so '
+            "notebooks are opened, evaluated cell by cell, and saved through the kernel. "
+            "Live windows and screenshots are unavailable."
+        )
+    return 'A "notebook" here means a LIVE WINDOW inside the Mathematica frontend, not a `.nb` file on disk.'
+
+
 def _profile_intro(features: FeatureFlags) -> str:
     if features.profile == "lean":
-        return (
-            'A "notebook" here means a LIVE WINDOW inside the Mathematica frontend, not a '
-            "`.nb` file on disk. This lean profile exposes 12 consolidated tools."
-        )
+        return _notebook_meaning() + " This lean profile exposes 12 consolidated tools."
     if _has_notebook(features):
-        return 'A "notebook" here means a LIVE WINDOW inside the Mathematica frontend, not a `.nb` file on disk.'
+        return _notebook_meaning()
     return "This profile is compute-first. Notebook tools are not exposed in this configuration."
 
 
@@ -115,7 +130,8 @@ def _routing_lines(features: FeatureFlags) -> list[str]:
             'Plot or notebook-visible output -> `evaluate(code, target="notebook")`',
             'New notebook -> `notebooks(action="create", title=...)` then `evaluate(code, target="notebook")`',
             'Inspect notebook state -> `cells(action="list"|"read")` or `screenshot(scope="cell")`',
-            'Existing `.nb` file on disk -> `read_notebook_file(path)`; `notebooks(action="open")` only for a live window',
+            'Existing `.nb` file on disk -> `read_notebook_file(path)` to read it; '
+            '`notebooks(action="open", path=...)` to open a session you can evaluate cell by cell',
             "Verify algebra steps -> `verify_derivation(steps)`",
             "Syntax uncertainty -> `evaluate(code, dry_run=True)`",
             'Errors or lost context -> `status()`, `kernel(action="messages")`, `guide(topic="errors")`',

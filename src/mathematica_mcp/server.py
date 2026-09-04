@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -357,11 +358,234 @@ async def _run_blocking(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+
+# ---------------------------------------------------------------------------
+# Notebook transport routing (headless hosts)
+# ---------------------------------------------------------------------------
+
+# Addon commands that mean "operate on a notebook". On a host with no front end
+# these cannot be served by the addon at all, so they are re-dispatched to the
+# headless backend, which works on the .nb file through the persistent kernel.
+_NOTEBOOK_COMMANDS = frozenset(
+    {
+        "get_notebooks",
+        "get_notebook_info",
+        "create_notebook",
+        "open_notebook_file",
+        "save_notebook",
+        "close_notebook",
+        "get_cells",
+        "get_cell_content",
+        "write_cell",
+        "delete_cell",
+        "evaluate_cell",
+        "execute_code_notebook",
+    }
+)
+
+# Genuinely front-end-only: they render or manipulate a window. There is no
+# headless equivalent, so they get a clear answer instead of a socket error
+# whose text points at StartMCPServer[] and sends the caller down a dead end.
+_FRONTEND_ONLY_COMMANDS = frozenset(
+    {
+        "screenshot_notebook",
+        "screenshot_cell",
+        "select_cell",
+        "scroll_to_cell",
+        "evaluate_selection",
+    }
+)
+
+_FRONTEND_PROBE_TTL = 30.0
+_frontend_probe: tuple[float, bool] | None = None
+
+
+def _frontend_is_available() -> bool:
+    """Whether a front end can actually service notebook commands right now.
+
+    Probed rather than assumed: a missing $DISPLAY is strong evidence but not
+    proof, and the addon may be connected to a session we cannot reason about
+    from environment variables alone. The result is cached briefly so this costs
+    one socket round-trip per half-minute rather than one per call.
+    """
+    global _frontend_probe
+    now = time.monotonic()
+    if _frontend_probe is not None and (now - _frontend_probe[0]) < _FRONTEND_PROBE_TTL:
+        return _frontend_probe[1]
+    _frontend_probe = (now, _probe_frontend())
+    return _frontend_probe[1]
+
+
+def _probe_frontend() -> bool:
+    """One probe of the addon, biased towards leaving a working setup alone.
+
+    Rerouting is only correct when there is positive evidence of no front end.
+    An addon that answers but predates the frontend_version field is still a
+    real Mathematica the user started, and hijacking its notebook commands
+    would break a setup that worked — so an unreported front end is treated as
+    present, and only an explicit "Unavailable" (or an unreachable addon) sends
+    notebook work to the headless backend.
+    """
+    try:
+        result = _try_addon_command("get_status", {}, timeout=2.0)
+    except Exception:  # noqa: BLE001 — an unreachable addon is no front end
+        return False
+    if result.get("success") is False:
+        return False
+    if "frontend_version" not in result:
+        # An addon predating that field is still a real Mathematica the user
+        # started; trust it rather than hijacking a setup that worked.
+        return True
+    version = str(result.get("frontend_version", "")).strip().lower()
+    return version not in ("", "unavailable", "none", "null", "$failed")
+
+
+def reset_frontend_probe() -> None:
+    """Forget the cached front-end probe (tests, or after starting Mathematica)."""
+    global _frontend_probe
+    _frontend_probe = None
+
+
+def _notebook_transport() -> str:
+    """"addon" or "headless" — who should serve notebook commands."""
+    override = os.getenv("MATHEMATICA_NOTEBOOK_BACKEND", "").strip().lower()
+    if override in ("addon", "headless"):
+        return override
+    return "addon" if _frontend_is_available() else "headless"
+
+
+def _cell_index(raw: Any) -> int | None:
+    """Headless cells are addressed by index; the addon uses opaque ids."""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _headless_notebook_call(command: str, params: dict | None) -> dict:
+    """Serve one notebook command without a front end."""
+    from .headless_notebook import get_headless_notebooks
+
+    nb = get_headless_notebooks()
+    p = params or {}
+    notebook = p.get("notebook")
+
+    if command == "get_notebooks":
+        result = nb.list()
+        return {"success": True, "notebooks": result.get("notebooks", []), "headless": True} if result.get(
+            "success"
+        ) else result
+    if command == "get_notebook_info":
+        return nb.info(notebook)
+    if command == "create_notebook":
+        return nb.create(p.get("title") or "Untitled", p.get("path"))
+    if command == "open_notebook_file":
+        return nb.open(p.get("path") or "")
+    if command == "close_notebook":
+        return nb.close(notebook)
+    if command == "save_notebook":
+        fmt = (p.get("format") or "Notebook").strip()
+        if fmt != "Notebook":
+            return {
+                "success": False,
+                "error": f"Saving as {fmt} needs a front end to typeset the page; headless can only write .nb",
+                "headless": True,
+                "next_step": "notebooks(action='save', format='Notebook', path='...')",
+            }
+        return nb.save(notebook, p.get("path"))
+    if command == "get_cells":
+        return nb.cells(
+            notebook,
+            offset=int(p.get("offset") or 0),
+            limit=p.get("limit"),
+            include_content=bool(p.get("include_content", True)),
+        )
+    if command == "get_cell_content":
+        index = _cell_index(p.get("cell_id"))
+        if index is None:
+            return _headless_cell_id_error(p.get("cell_id"))
+        return nb.cells(notebook, offset=index, limit=1, include_content=True)
+    if command == "write_cell":
+        return nb.write_cell(
+            p.get("content") or "",
+            p.get("style") or "Input",
+            notebook,
+            p.get("position") or "End",
+            int(p.get("anchor") or 0),
+        )
+    if command == "delete_cell":
+        index = _cell_index(p.get("cell_id"))
+        if index is None:
+            return _headless_cell_id_error(p.get("cell_id"))
+        return nb.delete_cell(index, notebook)
+    if command == "evaluate_cell":
+        index = _cell_index(p.get("cell_id"))
+        if index is None:
+            return _headless_cell_id_error(p.get("cell_id"))
+        return nb.evaluate_cell(index, notebook, timeout=int(p.get("max_wait") or 60))
+    if command == "execute_code_notebook":
+        return _headless_execute_in_notebook(nb, p)
+    return {"success": False, "error": f"No headless equivalent for {command}", "headless": True}
+
+
+def _headless_cell_id_error(raw: Any) -> dict:
+    return {
+        "success": False,
+        "error": f"Headless notebooks address cells by index; {raw!r} is not one",
+        "headless": True,
+        "next_step": "cells(action='list') to see indices, then pass cell_id='3'",
+    }
+
+
+def _headless_execute_in_notebook(nb: Any, params: dict) -> dict:
+    """target="notebook" with no front end.
+
+    With a notebook open this appends and evaluates a cell, matching the addon.
+    With none open the code is still evaluated — in the kernel — because the
+    caller asked for a computation and refusing it outright would lose the work
+    over a detail they can fix afterwards. The response says which happened.
+    """
+    code = params.get("code") or ""
+    timeout = int(params.get("timeout") or 60)
+    if nb._resolve(params.get("notebook")) is not None:
+        return nb.execute_in_notebook(code, params.get("notebook"), timeout=timeout)
+
+    from .session import execute_in_kernel
+
+    result = execute_in_kernel(code, timeout=timeout)
+    result["headless"] = True
+    result["notebook_written"] = False
+    result["note"] = (
+        "No notebook is open, so this was evaluated in the kernel rather than written to a notebook. "
+        "Open one with notebooks(action='open', path=...) to have cells written."
+    )
+    return result
+
+
+def _frontend_only_error(command: str) -> dict:
+    return {
+        "success": False,
+        "error": f"{command} needs a Mathematica front end, and this host has none",
+        "headless": True,
+        "next_step": (
+            "Use cells(action='list') to read the notebook, or evaluate(...) and "
+            "screenshot(scope='expression') to rasterize a specific result."
+        ),
+    }
+
+
 async def _addon_result(
     command: str,
     params: dict | None = None,
     timeout: float | None = None,
 ) -> dict:
+    """Run an addon command, re-routing notebook work when there is no front end."""
+    if command in _NOTEBOOK_COMMANDS or command in _FRONTEND_ONLY_COMMANDS:
+        transport = await _run_blocking(_notebook_transport)
+        if transport == "headless":
+            if command in _FRONTEND_ONLY_COMMANDS:
+                return _frontend_only_error(command)
+            return await _run_blocking(_headless_notebook_call, command, params)
     return await _run_blocking(_try_addon_command, command, params, timeout)
 
 
@@ -370,7 +594,18 @@ async def _addon_json(command: str, params: dict | None = None) -> str:
 
 
 async def _image_from_result(result: dict) -> Image:
-    image_path = result["path"]
+    # A failed capture has no "path". Indexing it raised KeyError, which reached
+    # the caller as an opaque traceback instead of the reason the capture failed
+    # — and headless hosts, where screenshots are never available, hit this on
+    # every call. Raise the actual message; the tool returns an Image, so an
+    # exception is the only channel an error has.
+    image_path = result.get("path")
+    if not image_path:
+        raise RuntimeError(
+            result.get("error")
+            or result.get("output")
+            or "Screenshot failed: the addon returned no image path"
+        )
 
     def _read_and_remove() -> bytes:
         if not _is_valid_png(image_path):
@@ -666,6 +901,31 @@ def _warm_path_status() -> dict[str, Any]:
     }
 
 
+def _headless_status() -> dict[str, Any]:
+    """Which notebook backend is in play, and where the kernel came from.
+
+    Reported on every status call because the difference is invisible otherwise:
+    a headless host still answers "connection_mode": "addon" whenever the server
+    has connected to a kernel — including one it spawned itself — and the caller
+    then wastes a turn on notebook commands that cannot work.
+    """
+    from .kernel_discovery import find_wolfram_kernel, is_headless
+
+    transport = _notebook_transport()
+    status: dict[str, Any] = {
+        "display_detected": not is_headless(),
+        "notebook_backend": transport,
+        "kernel_path": find_wolfram_kernel() or "not found",
+    }
+    if transport == "headless":
+        status["note"] = (
+            "No front end. Notebooks are read and evaluated as .nb files on disk through the "
+            "persistent kernel: notebooks(action='open', path=...), cells(action='list'), "
+            "evaluate(code, target='notebook'). Screenshots and live windows are unavailable."
+        )
+    return status
+
+
 @_tool("core")
 async def get_mathematica_status() -> str:
     """Get connection status and system info."""
@@ -675,6 +935,7 @@ async def get_mathematica_status() -> str:
             raise RuntimeError(result["error"])
         result["connection_mode"] = "addon"
         result["warm_path"] = _warm_path_status()
+        result["headless"] = await _run_blocking(_headless_status)
         _check_addon_protocol(result)
         return _json_response(result)
     except Exception as e:
@@ -685,12 +946,25 @@ async def get_mathematica_status() -> str:
             from wolframclient.language import wlexpr
 
             version = session.evaluate(wlexpr("$VersionNumber"))
+            headless = await _run_blocking(_headless_status)
+            if headless["notebook_backend"] == "headless":
+                note = (
+                    "No front end on this host, so there is no live window to control. "
+                    "Notebook files still work: open, list, evaluate and save them with the "
+                    "headless backend. Nothing needs to be started in Mathematica."
+                )
+            else:
+                note = (
+                    "Addon not running - live notebook control unavailable. "
+                    "Execute StartMCPServer[] in Mathematica."
+                )
             return _json_response(
                 {
                     "connection_mode": "kernel_only",
                     "kernel_version": float(version),
-                    "note": "Addon not running - notebook control unavailable. Execute StartMCPServer[] in Mathematica.",
+                    "note": note,
                     "warm_path": _warm_path_status(),
+                    "headless": headless,
                     "error": str(e),
                 }
             )
@@ -1067,6 +1341,29 @@ async def execute_code(
                 }
                 if result.get("created_notebook"):
                     response["note"] = "Created new notebook 'Analysis'."
+                # The front-end path has no value to report — the cell renders in
+                # the window, and the caller reads it back with cells()/screenshot().
+                # Headless evaluation returns the value here and now, so dropping it
+                # would force a pointless second round-trip to see what was computed.
+                if result.get("headless"):
+                    response["headless"] = True
+                    response["cell_index"] = result.get("cell_index")
+                    response["output"] = result.get("output", "")
+                    if result.get("printed"):
+                        response["printed"] = result["printed"]
+                    if result.get("notebook_written") is False:
+                        # Say so in status/message, not just a side field: the
+                        # compact detail level keeps only a few keys, and a
+                        # response still reading "executed_in_notebook" would
+                        # tell the caller a cell was written when none was.
+                        response["notebook_written"] = False
+                        response["status"] = "executed_in_kernel_no_notebook_open"
+                        response["message"] = result.get("note") or (
+                            "No notebook is open; evaluated in the kernel instead."
+                        )
+                        response["next_step"] = (
+                            "notebooks(action='open', path=...) first if you want cells written."
+                        )
 
                 # NEW: Process error messages if present
                 if result.get("has_errors") or result.get("has_warnings"):
@@ -1182,6 +1479,37 @@ async def execute_code(
                 response_detail=response_detail,
                 expression_type=_expr_type,
             )
+
+    # On a headless host the persistent kernel is the single source of truth.
+    # Notebook cells already run there, so trying the addon first would split
+    # state across two kernels: a variable set by evaluate() would be invisible
+    # to the next notebook cell, and vice versa. That split is possible whenever
+    # a terminal Mathematica holds the addon port without a front end.
+    # With no addon at all this also skips a socket attempt that can only fail.
+    if await _run_blocking(_notebook_transport) == "headless":
+        result = await _run_blocking(
+            execute_in_kernel,
+            code,
+            format,
+            render_graphics=render_graphics,
+            deterministic_seed=deterministic_seed,
+            session_id=session_id,
+            isolate_context=isolate_context,
+            timeout=timeout,
+        )
+        result["executed_output_target"] = "cli"
+        if style is not None:
+            result["requested_style"] = style
+        _attach_image_if_valid(result)
+        return _finalize_execute_response(
+            result,
+            route_variant=route_variant,
+            execution_path=_EP.KERNEL_DIRECT_HEADLESS,
+            fell_back=False,
+            start_time=_exec_start,
+            response_detail=response_detail,
+            expression_type=_expr_type,
+        )
 
     # Check breaker before attempting addon_cli
     _cli_lease = None
@@ -1778,6 +2106,24 @@ def _register_optional_tools() -> None:
 # ============================================================================
 
 _GUIDE_CONTENT: dict[str, str] = {
+    "headless": (
+        "This host may have no Mathematica front end (check status() -> headless.notebook_backend). "
+        "When it is 'headless', a notebook is a .nb FILE, not a window:\n"
+        "  notebooks(action='open', path='/abs/path.nb')  - start a session on the file\n"
+        "  cells(action='list')                            - cells with indices; index IS the cell_id\n"
+        "  cells(action='read', cell_id='4')               - one cell's source\n"
+        "  evaluate_cell via cells indices, or evaluate(code, target='notebook') to append+run a cell\n"
+        "  notebooks(action='save', path=...)              - write the .nb back (format='Notebook' only)\n"
+        "Cells run in the persistent kernel in document order, so state carries between them, and a "
+        "cell that times out is aborted without losing the session. NotebookDirectory[] and "
+        "NotebookFileName[] are bound to the notebook's own directory, so cells that call them "
+        "work unpatched. Not available: screenshots, live windows, PDF/HTML export.\n"
+        "IMPORTANT: success:true means only that no WL exception was raised and the timeout did "
+        "not fire. It does NOT mean the cell did its work. A cell that shells out to an external "
+        "tool reports success even when that tool aborts, and a cell that loads a cached result "
+        "looks identical to one that computed it. After each chapter check an artifact - a "
+        "variable's Length/LeafCount, a file's mtime, an external tool's log - not the status."
+    ),
     "workflow": (
         "Compute: evaluate(code, target='kernel'). Show in a notebook: notebooks(action='create') "
         "then evaluate(code, target='notebook'). Interactive content (Manipulate/Dynamic/Animate) via "
@@ -1821,7 +2167,10 @@ _GUIDE_CONTENT: dict[str, str] = {
         "rasterize_expression, select_cell, scroll_to_cell, export_notebook, list_variables, get_variable, "
         "set_variable, clear_variables, get_expression_info, get_messages, open_notebook_file, run_script, "
         "trace_evaluation, time_expression, check_syntax, import_data, export_data, list_import_formats, "
-        "export_graphics. Example: batch(ops=[{'command': 'execute_code', 'params': {'code': '1+1'}}])."
+        "export_graphics. Example: batch(ops=[{'command': 'execute_code', 'params': {'code': '1+1'}}]).\n"
+        "Addon only: batch has no headless dispatch, so on a host with no front end it fails with "
+        "[Errno 111] Connection refused however harmless the ops are. Headless, issue the calls "
+        "individually, or drive notebook cells through evaluate(target='cell', timeout=...)."
     ),
 }
 
@@ -2233,7 +2582,15 @@ async def read_notebook_file(
 @_tool("lean")
 async def guide(
     topic: Literal[
-        "workflow", "errors", "notebook_hygiene", "screenshots", "v15", "profiles", "toolsets", "batch"
+        "workflow",
+        "errors",
+        "notebook_hygiene",
+        "screenshots",
+        "v15",
+        "profiles",
+        "toolsets",
+        "batch",
+        "headless",
     ] = "workflow",
 ) -> str:
     """On-demand guidance. topic: workflow | errors | notebook_hygiene | screenshots | v15 | profiles | toolsets | batch."""
