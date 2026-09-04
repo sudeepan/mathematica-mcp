@@ -4,13 +4,14 @@ import hashlib
 import json
 import logging
 import os
-import platform
 import re
 import subprocess
 import time
 import zlib
 from dataclasses import dataclass
 from typing import Any
+
+from .kernel_discovery import kernel_environment, mark_process_as_kernel_parent
 
 logger = logging.getLogger("mathematica_mcp.session")
 
@@ -251,35 +252,16 @@ def _wrap_code_for_determinism(code: str, deterministic_seed: int | None) -> str
 
 
 def find_wolfram_kernel() -> str | None:
-    system = platform.system()
-    potential_paths: list[str] = []
+    """Absolute path to a Wolfram kernel, or None.
 
-    if system == "Darwin":
-        potential_paths = [
-            "/Applications/Mathematica.app/Contents/MacOS/WolframKernel",
-            "/Applications/Wolfram.app/Contents/MacOS/WolframKernel",
-            "/Applications/Wolfram Engine.app/Contents/MacOS/WolframKernel",
-        ]
-    elif system == "Windows":
-        program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
-        for version in ["15.1", "15.0", "15", "14.2", "14.1", "14.0", "13.3", "13.2", "13.1", "13.0"]:
-            potential_paths.append(
-                os.path.join(
-                    program_files,
-                    f"Wolfram Research\\Mathematica\\{version}\\WolframKernel.exe",
-                )
-            )
-    elif system == "Linux":
-        for version in ["15.1", "15.0", "15", "14.2", "14.1", "14.0", "13.3", "13.2", "13.1", "13.0"]:
-            potential_paths.append(f"/usr/local/Wolfram/Mathematica/{version}/Executables/WolframKernel")
+    Delegates to :mod:`kernel_discovery`, which searches env vars, a cached
+    result, PATH, the vendor install roots and (bounded) $HOME. A None here is
+    load-bearing: the caller latches permanent-cold on it, so under-reporting
+    costs the persistent kernel for the whole process lifetime.
+    """
+    from .kernel_discovery import find_wolfram_kernel as _discover
 
-    for path in potential_paths:
-        if os.path.exists(path):
-            logger.info(f"Found Wolfram Kernel at: {path}")
-            return path
-
-    logger.warning("Could not find Wolfram Kernel in standard locations")
-    return None
+    return _discover()
 
 
 def _parse_association_output(output: str) -> dict[str, Any]:
@@ -428,6 +410,7 @@ Module[{{startTime, result, messages, timing, response, outInput, outFull="", ou
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=kernel_environment(),
         )
         python_timing = int((time.time() - start_time) * 1000)
         output = result.stdout.strip()
@@ -890,6 +873,7 @@ def evaluate_wl(code: str, timeout: int = 60, *, allow_addon_fallback: bool = Fa
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=kernel_environment(),
         )
     except subprocess.TimeoutExpired:
         return WLResult(
@@ -971,6 +955,7 @@ Module[{{result, img}},
             capture_output=True,
             text=True,
             timeout=60,
+            env=kernel_environment(),
         )
         output = result.stdout.strip()
 

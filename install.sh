@@ -87,9 +87,17 @@ find_wolframscript() {
         candidates=(
             "/usr/local/bin/wolframscript"
             "/usr/bin/wolframscript"
-            "/opt/Wolfram/Mathematica/14.0/Executables/wolframscript"
-            "/usr/local/Wolfram/Mathematica/14.0/Executables/wolframscript"
         )
+        # Globbed, not a fixed version list: pinning "14.0" stops finding
+        # every release after it, and misses relocated installs entirely.
+        for root in \
+            /usr/local/Wolfram/*/*/Executables \
+            /opt/Wolfram/*/*/Executables \
+            /opt/Mathematica/*/Executables \
+            "$HOME"/*/Executables \
+            "$HOME"/*/*/*/*/Executables; do
+            [ -x "$root/wolframscript" ] && candidates+=("$root/wolframscript")
+        done
     fi
     
     for candidate in "${candidates[@]}"; do
