@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **One kernel on a headless host**: `evaluate(code, target="kernel")` previously tried the addon first and only fell back to the persistent kernel. With notebook cells now running in the persistent kernel, that would split state across two kernels whenever a terminal Mathematica holds port 9881 without a front end — a variable set by `evaluate` would be invisible to the next notebook cell. Headless hosts now route both to the persistent kernel, which also skips a socket attempt that can only fail when no addon is running. Front-end setups are unaffected.
+- **Headless notebook backend**: on a host with no front end, `notebooks`/`cells`/`edit_cells` and `evaluate(target="notebook")` now operate on the `.nb` file through the persistent kernel instead of failing. A notebook is opened as its `Notebook[...]` expression, cells are replayed in document order exactly as Shift+Enter would (`ToExpression[content /. BoxData[b_] :> b, StandardForm]`), state carries between cells, and edits can be saved back. New helper `helpers/headless_notebook.wl` and driver `headless_notebook.py`. Routing is automatic (probe of the addon's `frontend_version`), overridable with `MATHEMATICA_NOTEBOOK_BACKEND=addon|headless`.
+- **`NotebookDirectory[]` resolves headlessly**: bound to the notebook's own directory during cell evaluation, along with `NotebookFileName[]`. Cells that begin `SetDirectory[NotebookDirectory[]]` now run unpatched.
+- **`guide(topic="headless")`**, plus `status()` reporting `headless.notebook_backend`, `display_detected` and the resolved `kernel_path`; `doctor` reports kernel discovery and headless mode.
+
+### Fixed
+
+- **Kernel discovery no longer misses relocated installs**: the Linux search knew only `/usr/local/Wolfram/Mathematica/<version>` from a hardcoded version list, so an install under `$HOME` or `/opt` resolved to `None` — which latches the process into cold-`wolframscript` mode permanently, since `get_kernel_session()` treats a missing kernel as structurally hopeless. Discovery now consults `MATHEMATICA_KERNEL_PATH`/`WOLFRAMSCRIPT_KERNELPATH`, a cached result, `PATH` (following symlinks), version-globbed vendor roots, `wolframscript`'s own `$InstallationDirectory`, and a pruned scan of `$HOME`. The result is cached to `~/.config/mathematica-mcp/kernel-path`.
+- **`wolframscript` no longer fails under a minimal environment**: MCP clients spawn the server without the user's shell `PATH`, so `wolframscript` ran its own lookup and died with *"A WolframKernel location could not be determined"* on machines where it works when typed by hand. Spawned processes now inherit `WOLFRAMSCRIPT_KERNELPATH` and the installation's `Executables` directory on `PATH`.
+- **A spawned kernel can no longer steal the addon port**: `Kernel/init.m` runs in *every* kernel — `-noinit` does not suppress it under `wolframscript` — so a kernel the server spawned would run `StartMCPServer[]`, bind port 9881, and become "the addon" the client then connected to: a front-end-less child reporting `connection_mode: "addon"`, with the user's real Mathematica unable to bind the port afterwards. Spawned kernels now carry `MATHEMATICA_MCP_CHILD=1`, which both the addon and the installed `init.m` loader honour by declining to start the server.
+- **`install.wl` writes a delimited, idempotent `init.m` section**: the previous cleanup dropped every line containing `MathematicaMCP`, which cannot express a multi-line guard without leaving a dangling `If[...]` that breaks every kernel launch. Legacy sections still upgrade cleanly.
+- **A failed screenshot reports why**: `_image_from_result` indexed `result["path"]` unconditionally, so any capture failure surfaced as an opaque `KeyError` instead of the addon's message.
+
 ## [1.1.2] - 2026-07-06
 
 ### Fixed

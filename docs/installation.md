@@ -363,6 +363,31 @@ See [Add wolframscript to PATH](#add-wolframscript-to-path) above.
 2. Check the absolute path in your client config is correct
 3. Ensure no firewall is blocking port 9881
 
+### A long evaluation dies after ~30 minutes
+
+That ceiling belongs to your **MCP client**, not to this server, and no `timeout`
+argument passed to a tool can lift it. The client stops waiting on a call it
+considers idle and propagates an abort to the kernel, so a WL-side
+`TimeConstrained` set higher never gets the chance to fire.
+
+Raise it in the client config by adding a per-server `timeout` **in milliseconds**
+alongside `command`/`args`:
+
+```jsonc
+"mathematica": {
+  "command": "uvx",
+  "args": ["mathematica-mcp-full"],
+  "timeout": 7200000        // 2 hours
+}
+```
+
+Claude Code also honours `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (milliseconds; `0`
+disables). Note that a client backgrounding a call after ~120s and notifying you
+on completion is normal progress reporting, not this timeout.
+
+The abort itself is clean: the persistent session, its subkernels, loaded packages
+and every prior variable survive, so you can query state afterwards and resume.
+
 ---
 
 ## Advanced Configuration
