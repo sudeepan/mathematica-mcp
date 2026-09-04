@@ -4,10 +4,12 @@
 
 BeginPackage["MathematicaMCP`"];
 
-StartMCPServer::usage = "StartMCPServer[] starts the MCP socket server on the configured port (default 9881).";
+StartMCPServer::usage = "StartMCPServer[] starts the MCP socket server on the configured port (default 9881). Declines silently in a kernel spawned by the Python MCP server itself (MATHEMATICA_MCP_CHILD=1); pass \"Force\" -> True to override.";
 StopMCPServer::usage = "StopMCPServer[] stops the MCP socket server.";
 MCPServerStatus::usage = "MCPServerStatus[] returns the current server status.";
 RestartMCPServer::usage = "RestartMCPServer[] restarts the MCP socket server.";
+
+Options[StartMCPServer] = {"Force" -> False};
 
 Begin["`Private`"];
 
@@ -41,7 +43,24 @@ debugLog[msg_] := Module[{},
 (* SERVER MANAGEMENT                                                            *)
 (* ============================================================================ *)
 
-StartMCPServer[] := Module[{},
+(* True when this kernel was spawned by the Python MCP server itself. Such a
+   kernel must never host the addon socket: the server would then connect to its
+   own child instead of the user's front-end session, every notebook operation
+   would fail for want of a front end, and the user's real Mathematica could no
+   longer bind the port. The auto-start in Kernel/init.m runs in EVERY kernel,
+   including ours, so the guard belongs here rather than at the call site. *)
+mcpChildKernelQ[] := TrueQ[
+  Quiet[Check[Environment["MATHEMATICA_MCP_CHILD"], $Failed]] === "1"
+];
+
+StartMCPServer[opts:OptionsPattern[]] := Module[{force},
+  force = TrueQ[OptionValue[StartMCPServer, {opts}, "Force"]];
+  If[mcpChildKernelQ[] && !force,
+    (* Silent: this fires in every kernel the server spawns, and a message here
+       would land in the stdout that cold evaluations parse as JSON. *)
+    Return[$Failed]
+  ];
+
   If[$MCPListener =!= None,
     Print["[MathematicaMCP] Server already running on port ", $MCPPort];
     Return[$MCPListener]
@@ -54,6 +73,11 @@ StartMCPServer[] := Module[{},
   
   If[FailureQ[$MCPListener],
     Print["[MathematicaMCP] Failed to start server: ", $MCPListener];
+    If[StringContainsQ[ToString[$MCPListener], "Address already in use"],
+      Print["[MathematicaMCP] Port ", $MCPPort, " is held by another process. ",
+            "If that is a stale kernel, stop it; otherwise set $MCPPort before ",
+            "calling StartMCPServer[]."]
+    ];
     $MCPListener = None;
     Return[$Failed]
   ];

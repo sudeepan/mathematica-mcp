@@ -20,18 +20,45 @@ initContent = If[FileExistsQ[$InitPath], Import[$InitPath, "Text"], ""];
 If[!StringQ[initContent], initContent = ""];
 
 $MCPPackageFileNormalized = StringReplace[$MCPPackageFile, "\\" -> "/"];
+
+(* Explicit markers delimit the managed section. The previous installer removed
+   every line containing "MathematicaMCP", which cannot express a multi-line
+   block: the guard below has lines that do not mention the package, and a
+   line-wise filter would strip the body and leave a dangling If[...] that
+   breaks every kernel launch. *)
+$MCPBegin = "(* MathematicaMCP:begin - managed by install.wl, do not edit *)";
+$MCPEnd = "(* MathematicaMCP:end *)";
+
 loadCode = StringJoin[
-  "\n\n(* MathematicaMCP - Auto-load for LLM control *)\n",
-  "Quiet @ Get[\"", $MCPPackageFileNormalized, "\"];\n",
-  "MathematicaMCP`StartMCPServer[];\n"
+  "\n\n", $MCPBegin, "\n",
+  "(* Skipped in kernels spawned by the Python MCP server itself. Such a kernel\n",
+  "   must never host the addon socket - the server would connect to its own\n",
+  "   front-end-less child instead of this session, and the real Mathematica\n",
+  "   could no longer bind the port. Note that -noinit does NOT suppress this\n",
+  "   file under wolframscript, so the check has to live here. *)\n",
+  "If[Environment[\"MATHEMATICA_MCP_CHILD\"] =!= \"1\",\n",
+  "  Quiet @ Get[\"", $MCPPackageFileNormalized, "\"];\n",
+  "  MathematicaMCP`StartMCPServer[];\n",
+  "];\n",
+  $MCPEnd, "\n"
 ];
 
-(* Idempotent rewrite: drop every line of any previous MathematicaMCP section
-   (the comment, Get[...], and StartMCPServer[] lines all contain the string
-   "MathematicaMCP"), then append the fresh loader. *)
+(* Idempotent rewrite: drop the marked section if present, else fall back to the
+   legacy line-wise filter so an install.m written by an older version upgrades
+   cleanly instead of accumulating a second loader. *)
 wasConfigured = StringContainsQ[initContent, "MathematicaMCP"];
-cleanedLines = Select[StringSplit[initContent, "\n"], !StringContainsQ[#, "MathematicaMCP"] &];
-cleanedContent = StringTrim[StringRiffle[cleanedLines, "\n"], RegularExpression["[\\n\\s]+$"]];
+cleanedContent =
+  If[StringContainsQ[initContent, $MCPBegin] && StringContainsQ[initContent, $MCPEnd],
+    StringReplace[
+      initContent,
+      Shortest[$MCPBegin ~~ ___ ~~ $MCPEnd] -> ""
+    ],
+    StringRiffle[
+      Select[StringSplit[initContent, "\n"], !StringContainsQ[#, "MathematicaMCP"] &],
+      "\n"
+    ]
+  ];
+cleanedContent = StringTrim[cleanedContent, RegularExpression["[\\n\\s]+$"]];
 
 If[!DirectoryQ[DirectoryName[$InitPath]],
   CreateDirectory[DirectoryName[$InitPath]]

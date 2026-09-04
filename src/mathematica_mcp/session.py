@@ -567,6 +567,10 @@ def get_kernel_session():
         try:
             _session_starting = True
             try:
+                # WolframLanguageSession spawns with the inherited environment
+                # (no env= parameter), so the child guard and the resolved
+                # kernel path must be on os.environ before construction.
+                mark_process_as_kernel_parent()
                 _kernel_session = WolframLanguageSession(kernel_path)
                 # Stamp activity before start()/evaluate() so the reaper never sees a
                 # fresh session as stale during its ~12s startup (belt to _session_starting).
