@@ -2135,7 +2135,13 @@ _GUIDE_CONTENT: dict[str, str] = {
     "errors": (
         "Failed evaluations return error_analysis with suggested_fix and, when available, retry_with (a "
         "corrected call you can rerun). check syntax first with evaluate(code, dry_run=True). Kernel wedged? "
-        "kernel(action='restart')."
+        "kernel(action='restart').\n"
+        "Long call aborted around 30 minutes? That ceiling is your MCP CLIENT, not this server, and no "
+        "timeout argument here can lift it: the client gives up on an idle call and propagates an abort "
+        "to the kernel, so a WL-side TimeConstrained set higher never fires. Raise it in the client "
+        "config - add \"timeout\": <milliseconds> to this server's entry (7200000 = 2h), or set "
+        "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT (0 disables). The abort itself is clean: the session, its "
+        "subkernels, loaded packages and all prior variables survive."
     ),
     "notebook_hygiene": (
         "One idea per cell; style='Section'/'Text' for structure, 'Input' for code. Evaluate a specific cell "
@@ -2410,6 +2416,14 @@ async def evaluate(
     if target == "cell":
         if not cell_id:
             return _json_response({"success": False, "error": "target=cell requires cell_id"})
+        # Headless is the exception to the note above. _headless_notebook_call
+        # feeds max_wait straight into the WL-side TimeConstrained, so with no
+        # front end it IS an execution timeout, and the 10s default truncates
+        # any cell that loads a package, which routinely takes 20-30s. Forward
+        # it there; the addon path keeps its poll-interval semantics untouched.
+        if await _run_blocking(_notebook_transport) == "headless":
+            out = await evaluate_cell(cell_id, notebook, session_id, max_wait=timeout)
+            return _lean_paginate(out)
         out = await evaluate_cell(cell_id, notebook, session_id)
         return _lean_paginate(_lean_annotate(out, "note", note) if note else out)
     if target == "selection":

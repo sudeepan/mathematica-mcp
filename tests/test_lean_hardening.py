@@ -73,9 +73,24 @@ async def test_evaluate_dry_run_plus_file_rejected():
 
 
 async def test_evaluate_cell_nondefault_timeout_gets_note(monkeypatch):
+    # Addon path: max_wait is a front-end poll interval, not an execution
+    # timeout, so timeout stays unforwarded and the caller is told so.
+    monkeypatch.setenv("MATHEMATICA_NOTEBOOK_BACKEND", "addon")
     _record(monkeypatch, "evaluate_cell", ret=json.dumps({"success": True}))
     out = json.loads(await srv.evaluate(target="cell", cell_id="c1", timeout=500))
     assert "timeout" in out["note"]
+
+
+async def test_evaluate_cell_headless_forwards_timeout_without_note(monkeypatch):
+    # Headless feeds max_wait straight into the WL-side TimeConstrained, so
+    # there it IS the execution timeout. Forward it, and do not tell the caller
+    # it was ignored — the 10s default otherwise truncates any cell that loads
+    # a package, which routinely takes 20-30s.
+    monkeypatch.setenv("MATHEMATICA_NOTEBOOK_BACKEND", "headless")
+    calls = _record(monkeypatch, "evaluate_cell", ret=json.dumps({"success": True}))
+    out = json.loads(await srv.evaluate(target="cell", cell_id="c1", timeout=500))
+    assert "note" not in out
+    assert calls[0][1]["max_wait"] == 500
 
 
 async def test_evaluate_cell_default_timeout_no_note(monkeypatch):
