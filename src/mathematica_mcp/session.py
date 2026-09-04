@@ -571,7 +571,19 @@ def get_kernel_session():
                 # (no env= parameter), so the child guard and the resolved
                 # kernel path must be on os.environ before construction.
                 mark_process_as_kernel_parent()
-                _kernel_session = WolframLanguageSession(kernel_path)
+                # wolframclient defaults stdout/stderr to subprocess.PIPE and never
+                # reads them, so nothing in this process drains the kernel's stdout.
+                # A cell writing more than the ~64KB pipe buffer to real stdout (a
+                # verbose package load, say) then blocks the kernel in write()
+                # forever. That is a syscall rather than WL evaluation, so
+                # TimeConstrained cannot abort it and the per-cell timeout never
+                # fires — the failure looks like an unkillable hang. Every result we
+                # read arrives over ZMQ, so this stream carries nothing; discard it.
+                _kernel_session = WolframLanguageSession(
+                    kernel_path,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
                 # Stamp activity before start()/evaluate() so the reaper never sees a
                 # fresh session as stale during its ~12s startup (belt to _session_starting).
                 _note_activity()

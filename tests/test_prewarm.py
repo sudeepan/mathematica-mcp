@@ -54,7 +54,7 @@ def test_get_kernel_session_race_boots_one_kernel(monkeypatch, _reset_session):
     count_lock = threading.Lock()
 
     class _FakeWLSession:
-        def __init__(self, kernel_path):
+        def __init__(self, kernel_path, stdout=None, stderr=None):
             with count_lock:
                 instantiations.append(kernel_path)
             time.sleep(0.1)  # widen the window so both threads race the create path
@@ -205,7 +205,7 @@ def _install_fake_wl(monkeypatch, *, fail_starts=0):
     budget = [fail_starts]
 
     class _FakeWLSession:
-        def __init__(self, kernel_path):
+        def __init__(self, kernel_path, stdout=None, stderr=None):
             instantiations.append(kernel_path)
             self._kp = kernel_path
 
