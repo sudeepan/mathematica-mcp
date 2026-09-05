@@ -282,3 +282,99 @@ def test_close_kernel_session_resets_cooldown(monkeypatch, _reset_session):
 
     S.close_kernel_session()
     assert S._boot_retry_after == 0.0
+
+
+def test_evaluate_wl_bounds_wait_when_kernel_stops_answering(monkeypatch, _reset_session):
+    """A dead kernel must surface an error, not hang forever.
+
+    TimeConstrained bounds a running kernel; it cannot bound one that crashed,
+    because nothing is left to run it. Reproduced on a host whose Mathematica
+    kernel died at launch: wolframclient sat in zmq_poll indefinitely and the
+    whole test suite stalled. Regression guard for that.
+    """
+    import concurrent.futures as _cf
+
+    terminated = []
+
+    class _NeverAnswers:
+        def evaluate_wrap_future(self, expr):
+            return _cf.Future()  # never resolved: the kernel is gone
+
+        def log_message_from_result(self, result):
+            pass
+
+        def terminate(self):
+            terminated.append(True)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(S, "_kernel_session", _NeverAnswers())
+    monkeypatch.setattr(S, "_UNRESPONSIVE_GRACE_SECONDS", 0)
+    monkeypatch.setattr(S, "get_kernel_session", lambda: S._kernel_session)
+
+    result = S.evaluate_wl("1+1", timeout=0)
+
+    assert result.success is False
+    assert result.timed_out is True
+    assert "stopped responding" in result.error
+    assert terminated == [True], "the wedged session must be discarded"
+    assert S._kernel_session is None, "next call must build a fresh kernel"
+
+
+def test_execute_in_kernel_bounds_wait_when_kernel_stops_answering(monkeypatch, _reset_session):
+    """The main execution path needs the same bound as evaluate_wl.
+
+    Fixing only evaluate_wl left execute_in_kernel, the health check, the
+    startup probe and the status probe still able to hang forever, which made
+    the failure mode depend on which path you happened to hit.
+    """
+    import concurrent.futures as _cf
+
+    terminated = []
+
+    class _NeverAnswers:
+        def evaluate_wrap_future(self, expr):
+            return _cf.Future()  # never resolved: the kernel is gone
+
+        def log_message_from_result(self, result):
+            pass
+
+        def terminate(self):
+            terminated.append(True)
+
+    monkeypatch.setattr(S, "_kernel_session", _NeverAnswers())
+    monkeypatch.setattr(S, "_UNRESPONSIVE_GRACE_SECONDS", 0)
+    monkeypatch.setattr(S, "get_kernel_session", lambda: S._kernel_session)
+
+    result = S.execute_in_kernel("1+1", timeout=0)
+
+    assert result["success"] is False
+    assert result["error"] == "kernel_unresponsive"
+    assert result["timed_out"] is True
+    assert terminated == [True]
+    assert S._kernel_session is None
+
+
+def test_evaluate_bounded_passes_through_sessions_without_futures():
+    """Older wolframclient and the suite's own doubles expose only evaluate()."""
+
+    class _OldStyle:
+        def evaluate(self, expr):
+            return "42"
+
+    assert S.evaluate_bounded(_OldStyle(), "anything", 0.01) == "42"
+
+
+def test_evaluate_bounded_raises_rather_than_waiting():
+    import concurrent.futures as _cf
+
+    class _NeverAnswers:
+        def evaluate_wrap_future(self, expr):
+            return _cf.Future()
+
+        def log_message_from_result(self, result):
+            pass
+
+    with pytest.raises(S.KernelUnresponsive):
+        S.evaluate_bounded(_NeverAnswers(), "anything", 0.01)

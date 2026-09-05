@@ -8,6 +8,7 @@ import re
 import subprocess
 import time
 import zlib
+from concurrent.futures import TimeoutError as _FutureTimeout
 from dataclasses import dataclass
 from typing import Any
 
@@ -523,7 +524,7 @@ def get_kernel_session():
         try:
             from wolframclient.language import wlexpr
 
-            _kernel_session.evaluate(wlexpr("1"))
+            evaluate_bounded(_kernel_session, wlexpr("1"), _HEALTH_CHECK_WAIT)
             _last_kernel_health_check = time.monotonic()
             _note_activity()
             return _kernel_session
@@ -588,7 +589,7 @@ def get_kernel_session():
                 # fresh session as stale during its ~12s startup (belt to _session_starting).
                 _note_activity()
                 _kernel_session.start()
-                _kernel_session.evaluate(wlexpr("1+1"))
+                evaluate_bounded(_kernel_session, wlexpr("1+1"), _STARTUP_PROBE_WAIT)
             finally:
                 _session_starting = False
             _last_kernel_health_check = time.monotonic()
@@ -820,6 +821,68 @@ def _try_addon_eval(code: str, timeout: int) -> WLResult | None:
     return WLResult(text=text.strip(), success=True, execution_method="addon")
 
 
+# Extra wall-clock slack allowed past a cell's own limit before the kernel is
+# presumed dead. The Wolfram-side TimeConstrained bounds a *running* kernel; it
+# cannot bound one that has crashed or stopped answering, because there is
+# nothing left to run it. wolframclient then waits on its ZMQ socket forever.
+# Generous on purpose: only a kernel that is not answering at all reaches this,
+# never a legitimate evaluation that is merely slow.
+_UNRESPONSIVE_GRACE_SECONDS = 30
+
+# A liveness ping answers in milliseconds on any working kernel; seconds of
+# silence means it is gone. Startup gets far longer: a cold boot is ~12s.
+_HEALTH_CHECK_WAIT = 10.0
+_STARTUP_PROBE_WAIT = 60.0
+
+
+class KernelUnresponsive(RuntimeError):
+    """The kernel did not answer at all - it has crashed or wedged."""
+
+
+def evaluate_bounded(session: Any, expr: Any, wait: float) -> Any:
+    """``session.evaluate(expr)``, abandoned if the kernel stops answering.
+
+    Every call that can block on a kernel goes through here. TimeConstrained
+    only bounds a *running* kernel; a crashed one leaves wolframclient waiting
+    on its ZMQ socket forever, which presents as an unkillable hang with no
+    error. Raising :class:`KernelUnresponsive` lets each caller's existing
+    failure path deal with it.
+
+    Mirrors ``evaluate()`` exactly - that is
+    ``evaluate_wrap_future(...).result()``, then ``log_message_from_result``
+    and ``result.get()`` - so the value returned is identical. Sessions
+    exposing only ``evaluate()`` (older wolframclient, and the suite's test
+    doubles) keep the unbounded path rather than break.
+    """
+    wrap_future = getattr(session, "evaluate_wrap_future", None)
+    if wrap_future is None:
+        return session.evaluate(expr)
+    future = wrap_future(expr)
+    try:
+        wrapped = future.result(timeout=wait)
+    except _FutureTimeout:
+        future.cancel()
+        raise KernelUnresponsive(f"no reply within {wait:g}s") from None
+    session.log_message_from_result(wrapped)
+    return wrapped.get()
+
+
+def _discard_unresponsive_session() -> None:
+    """Drop a session whose kernel stopped answering, leaving the latches alone.
+
+    Deliberately not close_kernel_session(): that reads as an explicit retry
+    request and clears both the permanent-cold latch and the boot cooldown.
+    Here the kernel failed on its own, so any existing backoff should still apply.
+    """
+    global _kernel_session, _last_kernel_health_check
+    if _kernel_session is not None:
+        with contextlib.suppress(Exception):
+            _kernel_session.terminate()
+        _kernel_session = None
+        _last_kernel_health_check = 0.0
+        logger.warning("Discarded unresponsive kernel session")
+
+
 def evaluate_wl(code: str, timeout: int = 60, *, allow_addon_fallback: bool = False) -> WLResult:
     """Evaluate a WL expression (typically one returning an Association), warm first.
 
@@ -856,7 +919,22 @@ def evaluate_wl(code: str, timeout: int = 60, *, allow_addon_fallback: bool = Fa
                 f"ToString[TimeConstrained[(\n{code}\n), {int(timeout)}, $Aborted], OutputForm, PageWidth -> Infinity]"
             )
             with _session_eval_lock:
-                text = session.evaluate(wlexpr(wrapped))
+                try:
+                    text = evaluate_bounded(
+                        session, wlexpr(wrapped), int(timeout) + _UNRESPONSIVE_GRACE_SECONDS
+                    )
+                except KernelUnresponsive as exc:
+                    _discard_unresponsive_session()
+                    return WLResult(
+                        text="",
+                        success=False,
+                        execution_method="wolframclient",
+                        error=(
+                            f"Kernel stopped responding ({exc}) past its {int(timeout)}s "
+                            f"limit. Session discarded; the next call starts a fresh kernel."
+                        ),
+                        timed_out=True,
+                    )
             if isinstance(text, str):
                 if text.strip() == "$Aborted":
                     return WLResult(
@@ -1187,7 +1265,23 @@ Module[{{res, msgs, imgPath = "{wl_raster_path}", didRaster = False}},
         # collides with the Association the Module returns on success.
         guarded_code = f'TimeConstrained[(\n{eval_code}\n), {int(timeout)}, "$Aborted"]'
         with _session_eval_lock:
-            combined_result = session.evaluate(wlexpr(guarded_code))
+            try:
+                combined_result = evaluate_bounded(
+                    session, wlexpr(guarded_code), int(timeout) + _UNRESPONSIVE_GRACE_SECONDS
+                )
+            except KernelUnresponsive as exc:
+                _discard_unresponsive_session()
+                if raster_temp_path and os.path.exists(raster_temp_path):
+                    os.remove(raster_temp_path)
+                return {
+                    "success": False,
+                    "output": f"Kernel stopped responding ({exc}); session discarded",
+                    "error": "kernel_unresponsive",
+                    "timed_out": True,
+                    "warnings": [],
+                    "timing_ms": int((time.time() - start_time) * 1000),
+                    "execution_method": "wolframclient",
+                }
         timing_ms = int((time.time() - start_time) * 1000)
 
         if isinstance(combined_result, str) and combined_result.strip() == "$Aborted":

@@ -945,7 +945,12 @@ async def get_mathematica_status() -> str:
                 raise RuntimeError("No kernel session available")
             from wolframclient.language import wlexpr
 
-            version = session.evaluate(wlexpr("$VersionNumber"))
+            from .session import evaluate_bounded
+
+            # Bounded: a status probe must never inherit the hang it is
+            # reporting on. KernelUnresponsive falls through to the
+            # "disconnected" branch below, which is the honest answer.
+            version = evaluate_bounded(session, wlexpr("$VersionNumber"), 10.0)
             headless = await _run_blocking(_headless_status)
             if headless["notebook_backend"] == "headless":
                 note = (
