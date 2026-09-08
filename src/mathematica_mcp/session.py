@@ -1030,7 +1030,7 @@ def _rasterize_via_wolframscript(code: str, image_size: int = 500) -> str | None
 
     rasterize_code = f'''
 Module[{{result, img}},
-  result = {code};
+  result = ({code});   (* parenthesised: see the note in execute_in_kernel *)
   If[Head[result] === Graphics || Head[result] === Graphics3D ||
      Head[result] === Legended || Head[result] === Image ||
      MatchQ[result, _Show],
@@ -1240,7 +1240,9 @@ def execute_in_kernel(
         eval_code = f"""
 Module[{{res, msgs, imgPath = "{wl_raster_path}", didRaster = False}},
   Block[{{$MessageList = {{}}}},
-    res = {wrapped_code};
+    (* Parenthesised: Set binds tighter than CompoundExpression, so a bare
+       `res = a; b; c` assigns only `a` and silently discards the rest. *)
+    res = ({wrapped_code});
     msgs = $MessageList;
   ];
   <|

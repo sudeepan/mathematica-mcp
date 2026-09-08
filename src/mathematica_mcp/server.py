@@ -1203,6 +1203,7 @@ async def execute_code(
     max_wait: int = 30,
     sync: Literal["none", "refresh", "strict"] = "none",
     sync_wait: float = 2,
+    notebook: str | None = None,
 ) -> str:
     """Execute Wolfram Language code."""
     import time as _time
@@ -1246,6 +1247,10 @@ async def execute_code(
             # mode="kernel" is the new fast path (no polling)
             params = {
                 "code": code,
+                # Without this the headless dispatch never sees the handle, so
+                # _resolve falls to its "only open notebook" branch and silently
+                # evaluates in the kernel whenever that is ambiguous.
+                "notebook": notebook,
                 "max_wait": max_wait,
                 "mode": mode,
                 "session_id": session_id,
@@ -2450,6 +2455,7 @@ async def evaluate(
             response_detail=_LEAN_RESPONSE_DETAIL,  # type: ignore[arg-type]
             session_id=session_id,
             timeout=timeout,
+            notebook=notebook,
         )
     finally:
         _lean_paginated.reset(_token)

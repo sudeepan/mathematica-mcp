@@ -84,7 +84,8 @@ class HeadlessNotebooks:
         arglist = ", ".join(_wl_arg(a) for a in args)
         code = (
             "Module[{},"
-            f"  If[!TrueQ[$MCPHeadlessNotebookLoaded], Get[{helper}]; $MCPHeadlessNotebookLoaded = True];"
+            f"  If[!TrueQ[$MCPHeadlessNotebookLoaded],"
+            f"    If[Get[{helper}] =!= $Failed, $MCPHeadlessNotebookLoaded = True]];"
             f"  MCPHeadlessNotebook`{function}[{arglist}]"
             "]"
         )
@@ -181,6 +182,17 @@ class HeadlessNotebooks:
         if result.get("success"):
             with _registry_lock:
                 self._sessions[notebook_id] = _Session(notebook_id, abs_path)
+        else:
+            # The id is already minted and appears in the reply, so a caller that
+            # ignores this will hold a handle nothing can resolve — and the next
+            # evaluate(target="notebook") silently runs in the kernel instead.
+            # Say so loudly rather than hand back a dead handle.
+            logger.warning(
+                "headless open did not register %s (%s): handle is not usable",
+                notebook_id,
+                result.get("error", "no success flag in reply"),
+            )
+            result["registered"] = False
         return result
 
     def create(self, title: str = "Untitled", path: str | None = None) -> dict[str, Any]:
@@ -207,7 +219,30 @@ class HeadlessNotebooks:
         return result
 
     def list(self) -> dict[str, Any]:
-        return self._call("MCPList")
+        """Notebooks this process can actually address.
+
+        Reads the registry rather than asking the kernel, because the registry is
+        what `_resolve` consults: a kernel-side listing could show notebooks that
+        every other method then fails to find. Kernel entries with no registry
+        row are reported separately as `unregistered` instead of being hidden.
+        """
+        with _registry_lock:
+            rows = [
+                {"id": s.notebook_id, "path": s.path, "title": s.title, "created": s.created}
+                for s in self._sessions.values()
+            ]
+            known = {s.notebook_id for s in self._sessions.values()}
+        out: dict[str, Any] = {"success": True, "notebooks": rows, "headless": True}
+        kernel_side = self._call("MCPList")
+        if kernel_side.get("success"):
+            stray = [
+                n.get("id")
+                for n in kernel_side.get("notebooks", [])
+                if n.get("id") and n.get("id") not in known
+            ]
+            if stray:
+                out["unregistered"] = stray
+        return out
 
     def info(self, notebook: str | None = None) -> dict[str, Any]:
         notebook_id = self._resolve(notebook)
