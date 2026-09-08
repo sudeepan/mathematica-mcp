@@ -499,6 +499,7 @@ def _headless_notebook_call(command: str, params: dict | None) -> dict:
             offset=int(p.get("offset") or 0),
             limit=p.get("limit"),
             include_content=bool(p.get("include_content", True)),
+            style=p.get("style"),
         )
     if command == "get_cell_content":
         index = _cell_index(p.get("cell_id"))
@@ -894,11 +895,20 @@ def _warm_path_status() -> dict[str, Any]:
     """Warm-funnel diagnostics for status responses (plan §3.5): cold-execution
     counter (0 on the lean happy path), persistent-session liveness, and the
     idle-shutdown timeout."""
-    return {
+    from .session import kernel_generation, wolfram_process_census
+
+    out: dict[str, Any] = {
         "cold_executions": cold_execution_count(),
         "kernel_session_active": has_existing_kernel_session(),
         "idle_timeout_seconds": kernel_idle_timeout(),
+        # >1 means this process has been through at least one kernel swap, so
+        # anything defined before it is gone.
+        "kernel_generation": kernel_generation(),
     }
+    census = wolfram_process_census()
+    if census:
+        out["wolfram_processes"] = census
+    return out
 
 
 def _headless_status() -> dict[str, Any]:

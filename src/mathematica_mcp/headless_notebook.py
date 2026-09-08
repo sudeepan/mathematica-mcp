@@ -282,12 +282,19 @@ class HeadlessNotebooks:
         offset: int = 0,
         limit: int | None = None,
         include_content: bool = True,
+        style: str | None = None,
     ) -> dict[str, Any]:
+        """List cells, optionally only those of one style.
+
+        The style filter is applied kernel-side before offset/limit, because
+        filtering a page after the fact would drop matches lying outside it.
+        Returned indices stay notebook-wide so they remain valid for evaluation.
+        """
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
         return self._call_with_session(
-            "MCPCells", notebook_id, int(offset), int(limit or 0), bool(include_content)
+            "MCPCells", notebook_id, int(offset), int(limit or 0), bool(include_content), str(style or "")
         )
 
     def evaluate_cell(self, index: int, notebook: str | None = None, timeout: int = 60) -> dict[str, Any]:

@@ -31,6 +31,81 @@ _boot_retry_after: float = 0.0
 # whenever this is True.
 _session_starting: bool = False
 _last_kernel_health_check: float = 0.0
+# Kernel identity. A replaced kernel loses every definition, and until now that
+# was silent: a caller saw $Failed or a plain answer with no hint that a day of
+# state had gone. Rather than stamp the pid on every response (noise on
+# thousands of calls to serve a handful), the change is announced once, on the
+# first result after it happens.
+_kernel_generation: int = 0
+_kernel_change_unreported: bool = False
+
+
+def wolfram_process_census() -> dict[str, Any] | None:
+    """Count Wolfram processes on this machine, and how many are orphaned.
+
+    Licence starvation does not announce itself. A cold ``wolframscript`` that
+    is refused a licence exits with **empty output and no error**, which reads
+    downstream as a code bug - "expected X, got ''". Leaked kernels are the
+    usual cause, since each holds a seat until killed and nothing reaps them.
+    A count is the cheapest way to make that diagnosable at a glance.
+
+    Linux-only: reads /proc. Returns None elsewhere rather than guessing.
+    """
+    if not os.path.isdir("/proc"):
+        return None
+    total = orphaned = 0
+    orphan_rss_kb = 0
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                    if b"WolframKernel" not in fh.read():
+                        continue
+                total += 1
+                with open(f"/proc/{entry}/stat", encoding="utf-8") as fh:
+                    # ppid is field 4, but the comm field can contain spaces
+                    ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+                if ppid == 1:
+                    orphaned += 1
+                    with open(f"/proc/{entry}/status", encoding="utf-8") as fh:
+                        for line in fh:
+                            if line.startswith("VmRSS:"):
+                                orphan_rss_kb += int(line.split()[1])
+                                break
+            except (OSError, ValueError, IndexError):
+                continue  # the process went away mid-scan; not worth failing over
+    except OSError:
+        return None
+    out: dict[str, Any] = {"wolfram_processes": total, "orphaned": orphaned}
+    if orphaned:
+        out["orphaned_mb"] = round(orphan_rss_kb / 1024)
+        out["note"] = (
+            f"{orphaned} Wolfram process(es) have no parent and will never be reaped. "
+            "Each holds a licence seat; when seats run out wolframscript returns empty "
+            "output rather than an error. Kill them if a cold evaluation starts coming "
+            "back blank."
+        )
+    return out
+
+
+def kernel_generation() -> int:
+    """How many kernels this process has built. 1 means the original."""
+    return _kernel_generation
+
+
+def take_kernel_change_notice() -> bool:
+    """True exactly once after the kernel has been replaced, then False.
+
+    Consumed rather than latched, so the notice rides the first response that
+    follows the swap and does not repeat on every later call.
+    """
+    global _kernel_change_unreported
+    if _kernel_change_unreported:
+        _kernel_change_unreported = False
+        return True
+    return False
 # 30s (was 5s): every eval path already self-heals on exception, so the ping is
 # belt-and-suspenders and needn't burn a round-trip every 5s of wall clock.
 KERNEL_HEALTH_CHECK_INTERVAL = 30.0
@@ -502,6 +577,7 @@ Module[{{startTime, result, messages, timing, response, outInput, outFull="", ou
 
 def get_kernel_session():
     global _kernel_session, _use_wolframscript, _last_kernel_health_check, _session_starting, _boot_retry_after
+    global _kernel_generation, _kernel_change_unreported
 
     if _use_wolframscript:
         return None
@@ -589,6 +665,11 @@ def get_kernel_session():
                 # fresh session as stale during its ~12s startup (belt to _session_starting).
                 _note_activity()
                 _kernel_session.start()
+                _kernel_generation += 1
+                # The first kernel is a start, not a restart; only later ones
+                # mean a caller's state vanished underneath it.
+                if _kernel_generation > 1:
+                    _kernel_change_unreported = True
                 evaluate_bounded(_kernel_session, wlexpr("1+1"), _STARTUP_PROBE_WAIT)
             finally:
                 _session_starting = False
@@ -1321,6 +1402,16 @@ Module[{{res, msgs, imgPath = "{wl_raster_path}", didRaster = False}},
             "timing_ms": timing_ms,
             "execution_method": "wolframclient",
         }
+        if take_kernel_change_notice():
+            # Said once, on the first result after a kernel swap. Everything the
+            # previous kernel held is gone, and nothing else would say so.
+            response["kernel_restarted"] = True
+            response["kernel_generation"] = kernel_generation()
+            response["note"] = (
+                "The kernel was replaced since the last call, so variables, loaded "
+                "packages and definitions from before are gone. Re-run whatever this "
+                "result depends on."
+            )
 
         # Check if in-process rasterization produced an image
         did_raster = False

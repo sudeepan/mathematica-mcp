@@ -73,6 +73,8 @@ _COMPACT_KEEP = frozenset(
         "headless",  # which notebook backend answered — changes what follow-ups are possible
         "cell_index",  # headless cells are addressed by index, so this IS the handle
         "notebook_written",
+        "kernel_restarted",  # state loss is invisible without it; said once, never repeated
+        "kernel_generation",
     }
 )
 

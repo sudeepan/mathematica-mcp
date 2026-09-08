@@ -25,7 +25,7 @@
 BeginPackage["MCPHeadlessNotebook`"];
 
 MCPOpen::usage = "MCPOpen[id, path] loads a .nb into a headless session.";
-MCPCells::usage = "MCPCells[id, offset, limit, includeContent] lists cells.";
+MCPCells::usage = "MCPCells[id, offset, limit, includeContent, style] lists cells; style \"\" means all.";
 MCPEvaluateCell::usage = "MCPEvaluateCell[id, index, timeout] evaluates one cell.";
 MCPEvaluateRange::usage = "MCPEvaluateRange[id, from, to, timeout, stopOnError] evaluates a span of cells.";
 MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor] inserts a cell.";
@@ -168,12 +168,21 @@ MCPList[] := ok[<|
   "headless" -> True
 |>];
 
+(* Kept so a kernel still holding an older caller keeps working. *)
 MCPCells[id_String, offset_Integer, limit_Integer, includeContent : (True | False)] :=
-  sessionOr[id, Module[{nb, pos, cells, slice, upper},
+  MCPCells[id, offset, limit, includeContent, ""];
+
+MCPCells[id_String, offset_Integer, limit_Integer, includeContent : (True | False), style_String] :=
+  sessionOr[id, Module[{nb, pos, keep, cells, slice, upper},
     nb = $Sessions[id, "nb"];
     pos = leafPositions[nb];
-    upper = If[limit <= 0, Length[pos], Min[Length[pos], offset + limit]];
-    slice = Range[offset + 1, upper];
+    (* Filter BEFORE slicing: filtering a page would silently drop matches that
+       fall outside it. Indices stay notebook-wide, because callers evaluate by
+       them - renumbering to the filtered order would break that. *)
+    keep = Range[Length[pos]];
+    If[style =!= "", keep = Select[keep, cellStyle[Extract[nb, pos[[#]]]] === style &]];
+    upper = If[limit <= 0, Length[keep], Min[Length[keep], offset + limit]];
+    slice = If[upper >= offset + 1, Take[keep, {offset + 1, upper}], {}];
     cells = Table[
       Module[{c = Extract[nb, pos[[i]]], txt},
         txt = cellText[c];
@@ -189,7 +198,8 @@ MCPCells[id_String, offset_Integer, limit_Integer, includeContent : (True | Fals
       ],
       {i, slice}
     ];
-    ok[<|"id" -> id, "total" -> Length[pos], "offset" -> offset, "cells" -> cells|>]
+    ok[<|"id" -> id, "total" -> Length[keep], "offset" -> offset,
+        "style" -> style, "cells" -> cells|>]
   ]];
 
 (* ------------------------------------------------------------------------ *)
