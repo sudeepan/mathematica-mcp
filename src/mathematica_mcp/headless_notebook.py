@@ -216,6 +216,21 @@ class HeadlessNotebooks:
         result = self._call("MCPClose", notebook_id)
         with _registry_lock:
             self._sessions.pop(notebook_id, None)
+        if not result.get("success") and "No such headless notebook session" in str(result.get("error", "")):
+            # The kernel had already lost this session (a restart, or a swap we
+            # did not see). Every other session-taking method reopens and retries
+            # via _call_with_session, but reopening a notebook purely to close it
+            # is pointless: the caller's goal is already met, and the registry
+            # entry is dropped above either way. Report success, not a failure
+            # the caller can do nothing about.
+            logger.info("headless close: kernel had already lost %s; treating as closed", notebook_id)
+            return {
+                "success": True,
+                "id": notebook_id,
+                "closed": True,
+                "already_closed": True,
+                "headless": True,
+            }
         return result
 
     def list(self) -> dict[str, Any]:

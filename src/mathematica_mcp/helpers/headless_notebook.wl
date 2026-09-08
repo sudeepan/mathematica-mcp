@@ -88,6 +88,12 @@ cellText[c_] := Module[{content},
 
 executableQ[c_] := MemberQ[{"Input", "Code"}, cellStyle[c]];
 
+(* HoldRest is load-bearing: without it WL evaluates `body` before sessionOr is
+   entered, so the guard runs AFTER the thing it guards. Read-only callers get
+   away with it, but MCPClose deletes the session in its body and the guard then
+   reports the session missing - closing always "failed" while actually
+   succeeding. Holding the body makes the check happen first, for all callers. *)
+SetAttributes[sessionOr, HoldRest];
 sessionOr[id_, body_] := If[KeyExistsQ[$Sessions, id], body, err["No such headless notebook session: " <> ToString[id]]];
 
 (* ------------------------------------------------------------------------ *)
